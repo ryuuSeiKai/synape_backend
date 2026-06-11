@@ -1,20 +1,29 @@
 services:
+  caddy:
+    image: caddy:2
+    container_name: caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on:
+      - synape-server
+    restart: unless-stopped
+
   synape-server:
     build: .
     container_name: synape-server
-    ports:
-      - "3000:3000"
     environment:
       - PORT=3000
       - DATABASE_URL=postgres://synape:synape@synape-db:5432/synape?sslmode=disable
-      # OAuth — set your actual secrets here or in a .env file
+      # OAuth secrets from .env
       - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-Ov23liXcWby6XVM80TfG}
       - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-361959797138-ahsfia59q9cf6h6njln6qt26jk763jp7.apps.googleusercontent.com}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
-      # Deep-link scheme the desktop app registers (must match tauri.conf.json)
       - DEEP_LINK_SCHEME=${DEEP_LINK_SCHEME:-Synape}
-      # Optional — API upstream for non-auth routes
       - UPSTREAM_API=${UPSTREAM_API:-}
     depends_on:
       synape-db:
@@ -42,3 +51,4 @@ services:
 
 volumes:
   synape-pgdata:
+  caddy-data:

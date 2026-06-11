@@ -1,0 +1,3 @@
+67.217.243.181.sslip.io {
+    reverse_proxy synape-server:3000
+}
