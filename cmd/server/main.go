@@ -38,6 +38,7 @@ import (
 	"github.com/ryuuvu/synape-server/internal/config"
 	"github.com/ryuuvu/synape-server/internal/db"
 	"github.com/ryuuvu/synape-server/internal/handler"
+	"github.com/ryuuvu/synape-server/internal/marketplace"
 	"github.com/ryuuvu/synape-server/internal/proxy"
 	"github.com/ryuuvu/synape-server/internal/sync"
 )
@@ -96,6 +97,10 @@ func main() {
 	r.Get("/api/sync/pull/{kind}", syncH.Pull)
 	r.Put("/api/sync/push/{kind}", syncH.Push)
 	r.Delete("/api/sync/wipe", syncH.Wipe)
+
+	// Marketplace API routes
+	r.Get("/api/marketplace/skills", marketplace.HandleSkills)
+	r.Get("/api/marketplace/skill", marketplace.HandleSkill)
 
 	// Static pages
 	r.Get("/changelog", staticH.StaticPage)
