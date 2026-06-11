@@ -30,19 +30,66 @@ func NewHandler(store *db.Store, cfg config.Config) *Handler {
 // ─── OAuth Callback Redirects ──────────────────────────────────────────────
 
 // CallbackRedirect handles GET /auth/callback (GitHub OAuth callback).
-// Redirects to deep-link: Synape://oauth-callback?provider=github&code=...
+// Does the full exchange server-side — no deep-link needed.
 func (h *Handler) CallbackRedirect(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	if code == "" {
-		http.Error(w, "Missing authorization code", http.StatusBadRequest)
+		writeHTML(w, http.StatusBadRequest, `<html><body><h2>Missing code</h2></body></html>`)
 		return
 	}
-	redirect := fmt.Sprintf("%s://oauth-callback?provider=github&code=%s",
-		h.Config.DeepLinkScheme, urlencode(code))
-	log.Printf("[oauth] GitHub callback → redirecting to deep-link")
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, `<!DOCTYPE html><html><head><script>window.location.href=%s</script></head><body></body></html>`,
-		jsonEncode(redirect))
+
+	tok, err := exchangeGitHubCode(code, h.Config)
+	if err != nil {
+		log.Printf("[auth] GitHub callback exchange failed: %v", err)
+		writeHTML(w, http.StatusOK, authErrorPage("GitHub authentication failed: "+err.Error()))
+		return
+	}
+
+	ghUser, err := fetchGitHubUser(tok)
+	if err != nil {
+		log.Printf("[auth] GitHub callback user fetch failed: %v", err)
+		writeHTML(w, http.StatusOK, authErrorPage("Failed to fetch user info"))
+		return
+	}
+
+	email := ghUser.Email
+	if email == "" {
+		if e, err := fetchGitHubPrimaryEmail(tok); err == nil {
+			email = e
+		}
+	}
+
+	docID := fmt.Sprintf("gh:%d", ghUser.ID)
+	now := time.Now().UTC().Format(time.RFC3339)
+	existing, _ := h.Store.GetUserByDocID(docID)
+	createdAt := now
+	if existing != nil {
+		createdAt = existing.CreatedAt
+	}
+
+	user := &db.User{
+		ID: docID, UserID: ghUser.ID, Email: email,
+		DisplayName: ghUser.Login, FirstName: ghUser.Name, AvatarURL: ghUser.AvatarURL,
+		Slug: ghUser.Login, CreatedAt: createdAt,
+	}
+	if user.FirstName == "" {
+		user.FirstName = ghUser.Login
+	}
+	if err := h.Store.UpsertUser(user); err != nil {
+		log.Printf("[auth] upsert failed: %v", err)
+		writeHTML(w, http.StatusOK, authErrorPage("Failed to save user"))
+		return
+	}
+
+	prov := &db.Provider{
+		UserID: docID, Provider: "github",
+		ProviderUserID: fmt.Sprintf("%d", ghUser.ID),
+		ProviderLogin: ghUser.Login, Email: email, LinkedAt: createdAt,
+	}
+	_ = h.Store.UpsertProvider(prov)
+
+	log.Printf("[oauth] GitHub auth success: %s", ghUser.Login)
+	writeHTML(w, http.StatusOK, authSuccessPage(ghUser.Login))
 }
 
 // GoogleCallbackRedirect handles GET /auth/google-callback.html.
@@ -870,4 +917,34 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)
+}
+
+func writeHTML(w http.ResponseWriter, status int, html string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	w.Write([]byte(html))
+}
+
+func authSuccessPage(displayName string) string {
+	return fmt.Sprintf(`<!DOCTYPE html><html><head><title>Synape - Signed In</title><meta charset="utf-8">
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d1117;color:#e6edf3;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2.5rem;text-align:center;max-width:400px}.check{width:48px;height:48px;border-radius:50%;background:#238636;display:inline-flex;align-items:center;justify-content:center;font-size:24px;color:#fff;margin-bottom:1rem}img.avatar{width:48px;height:48px;border-radius:50%;margin-bottom:1rem}h2{margin:0 0 .5rem}p{color:#8b949e;margin:0 0 1.5rem;font-size:.9rem}.btn{display:inline-block;background:#238636;color:#fff;text-decoration:none;padding:.6rem 1.5rem;border-radius:6px;font-size:.9rem;cursor:pointer;border:none}.btn:hover{background:#2ea043}</style></head>
+<body><div class="card"><div class="check">✓</div>
+<h2>Signed in as %s</h2><p>You can close this window and return to Synape.</p>
+<button class="btn" onclick="window.close()">Close</button></div></body></html>`, htmlEsc(displayName))
+}
+
+func authErrorPage(msg string) string {
+	return fmt.Sprintf(`<!DOCTYPE html><html><head><title>Synape - Auth Error</title><meta charset="utf-8">
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d1117;color:#e6edf3;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2.5rem;text-align:center;max-width:400px}h2{color:#f85149;margin:0 0 .5rem}p{color:#8b949e;margin:0 0 1.5rem;font-size:.9rem}.btn{display:inline-block;background:#30363d;color:#e6edf3;text-decoration:none;padding:.6rem 1.5rem;border-radius:6px;font-size:.9rem;cursor:pointer;border:none}.btn:hover{background:#484f58}</style></head>
+<body><div class="card"><h2>Authentication failed</h2><p>%s</p><p>Close this window and try again.</p>
+<button class="btn" onclick="window.close()">Close</button></div></body></html>`, htmlEsc(msg))
+}
+
+func htmlEsc(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, "\"", "&quot;")
+	s = strings.ReplaceAll(s, "'", "&#39;")
+	return s
 }
