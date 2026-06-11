@@ -91,9 +91,17 @@ func (h *Handler) CallbackRedirect(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[oauth] GitHub auth success: %s", ghUser.Login)
 	// Redirect to deep-link with the actual token so the desktop app can store it.
 	deepLink := fmt.Sprintf("%s://oauth-callback?provider=github&token=%s", h.Config.DeepLinkScheme, urlencode(tok))
+	fallback := authSuccessPage(ghUser.Login)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, `<!DOCTYPE html><html><head><script>window.location.href=%s</script></head><body>%s</body></html>`,
-		jsonEncode(deepLink), authSuccessPage(ghUser.Login))
+	fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8">
+<script>
+window.location.href=%s;
+setTimeout(function(){
+  document.getElementById('fallback').style.display='block';
+}, 2000);
+</script></head><body>
+<div id="fallback" style="display:none">%s</div>
+</body></html>`, jsonEncode(deepLink), fallback)
 }
 
 // GoogleCallbackRedirect handles GET /auth/google-callback.html.
