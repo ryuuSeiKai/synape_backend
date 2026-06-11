@@ -930,11 +930,12 @@ func writeHTML(w http.ResponseWriter, status int, html string) {
 }
 
 func authSuccessPage(displayName string) string {
+	escaped := htmlEsc(displayName)
 	return fmt.Sprintf(`<!DOCTYPE html><html><head><title>Synape - Signed In</title><meta charset="utf-8">
-<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d1117;color:#e6edf3;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2.5rem;text-align:center;max-width:400px}.check{width:48px;height:48px;border-radius:50%;background:#238636;display:inline-flex;align-items:center;justify-content:center;font-size:24px;color:#fff;margin-bottom:1rem}img.avatar{width:48px;height:48px;border-radius:50%;margin-bottom:1rem}h2{margin:0 0 .5rem}p{color:#8b949e;margin:0 0 1.5rem;font-size:.9rem}.btn{display:inline-block;background:#238636;color:#fff;text-decoration:none;padding:.6rem 1.5rem;border-radius:6px;font-size:.9rem;cursor:pointer;border:none}.btn:hover{background:#2ea043}</style></head>
-<body><div class="card"><div class="check">✓</div>
-<h2>Signed in as %s</h2><p>You can close this window and return to Synape.</p>
-<button class="btn" onclick="window.close()">Close</button></div></body></html>`, htmlEsc(displayName))
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d1117;color:#e6edf3;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2.5rem;text-align:center;max-width:400px}.check{width:48px;height:48px;border-radius:50%;background:#238636;display:inline-flex;align-items:center;justify-content:center;font-size:24px;color:#fff;margin-bottom:1rem}h2{margin:0 0 .5rem}p{color:#8b949e;margin:0 0 1.5rem;font-size:.9rem}.btn{display:inline-block;background:#238636;color:#fff;padding:.6rem 1.5rem;border-radius:6px;font-size:.9rem;cursor:pointer;border:none}.btn:hover{background:#2ea043}</style></head>
+<body><div class="card"><div class="check">&#10003;</div>
+<h2>Signed in as ` + escaped + `</h2><p>You can close this window and return to Synape.</p>
+<button class="btn" onclick="window.close()">Close</button></div></body></html>`)
 }
 
 func authErrorPage(msg string) string {
