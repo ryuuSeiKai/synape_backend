@@ -7,7 +7,7 @@ services:
     environment:
       - PORT=3000
       - DATABASE_URL=postgres://synape:synape@synape-db:5432/synape?sslmode=disable
-      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-Ov23liXcWby6XVM80TfG}
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-Ov23li3UA9LciMtYCY3Y}
       - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-361959797138-ahsfia59q9cf6h6njln6qt26jk763jp7.apps.googleusercontent.com}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
