@@ -3,8 +3,7 @@ services:
     image: caddy:2
     container_name: caddy
     ports:
-      - "80:80"
-      - "443:443"
+      - "3443:3443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
@@ -15,16 +14,16 @@ services:
   synape-server:
     build: .
     container_name: synape-server
+    ports:
+      - "3001:3001"
     environment:
-      - PORT=3000
+      - PORT=3001
       - DATABASE_URL=postgres://synape:synape@synape-db:5432/synape?sslmode=disable
-      # OAuth secrets from .env
       - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-Ov23liXcWby6XVM80TfG}
       - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-361959797138-ahsfia59q9cf6h6njln6qt26jk763jp7.apps.googleusercontent.com}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
       - DEEP_LINK_SCHEME=${DEEP_LINK_SCHEME:-Synape}
-      - UPSTREAM_API=${UPSTREAM_API:-}
     depends_on:
       synape-db:
         condition: service_healthy

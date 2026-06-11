@@ -1,3 +1,4 @@
-67.217.243.181.sslip.io {
-    reverse_proxy synape-server:3000
+:3443 {
+    tls internal
+    reverse_proxy synape-server:3001
 }
