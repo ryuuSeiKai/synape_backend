@@ -1,6 +1,7 @@
 // Synape Server — Go implementation replacing the previous Express + Firebase Functions backend.
 //
 // Routes:
+//   GET  /                          — Homepage (this page)
 //   GET  /auth/callback              — GitHub OAuth callback (deep-link redirect)
 //   GET  /auth/google-callback.html  — Google OAuth callback (deep-link redirect)
 //   POST /api/auth/github/exchange   — Exchange GitHub code for token
@@ -65,6 +66,9 @@ func main() {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RealIP)
 	r.Use(securityHeaders)
+
+	// Homepage
+	r.Get("/", staticH.Home)
 
 	// Health check
 	r.Get("/health", staticH.Health)
