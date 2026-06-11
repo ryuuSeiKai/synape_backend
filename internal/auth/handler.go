@@ -89,7 +89,12 @@ func (h *Handler) CallbackRedirect(w http.ResponseWriter, r *http.Request) {
 	_ = h.Store.UpsertProvider(prov)
 
 	log.Printf("[oauth] GitHub auth success: %s", ghUser.Login)
-	writeHTML(w, http.StatusOK, authSuccessPage(ghUser.Login))
+	// First try deep-link to notify desktop app (may fail if scheme not registered).
+	// Desktop app catches Synape://oauth-callback with code=__done__ and calls /api/auth/me.
+	deepLink := fmt.Sprintf("%s://oauth-callback?provider=github&code=__done__", h.Config.DeepLinkScheme)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, `<!DOCTYPE html><html><head><script>window.location.href=%s</script></head><body>%s</body></html>`,
+		jsonEncode(deepLink), authSuccessPage(ghUser.Login))
 }
 
 // GoogleCallbackRedirect handles GET /auth/google-callback.html.
