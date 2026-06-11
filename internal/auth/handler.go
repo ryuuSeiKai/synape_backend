@@ -628,11 +628,15 @@ func exchangeGitHubCode(code string, cfg config.Config) (string, error) {
 		`{"client_id":"%s","client_secret":"%s","code":"%s"}`,
 		cfg.GitHubClientID, cfg.GitHubSecret, code,
 	)
-	resp, err := http.Post(
-		"https://github.com/login/oauth/access_token",
-		"application/json",
-		strings.NewReader(body),
-	)
+	req, err := http.NewRequest("POST", "https://github.com/login/oauth/access_token",
+		strings.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("http post: %w", err)
 	}
