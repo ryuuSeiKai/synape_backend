@@ -89,9 +89,8 @@ func (h *Handler) CallbackRedirect(w http.ResponseWriter, r *http.Request) {
 	_ = h.Store.UpsertProvider(prov)
 
 	log.Printf("[oauth] GitHub auth success: %s", ghUser.Login)
-	// First try deep-link to notify desktop app (may fail if scheme not registered).
-	// Desktop app catches Synape://oauth-callback with code=__done__ and calls /api/auth/me.
-	deepLink := fmt.Sprintf("%s://oauth-callback?provider=github&code=__done__", h.Config.DeepLinkScheme)
+	// Redirect to deep-link with the actual token so the desktop app can store it.
+	deepLink := fmt.Sprintf("%s://oauth-callback?provider=github&token=%s", h.Config.DeepLinkScheme, urlencode(tok))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, `<!DOCTYPE html><html><head><script>window.location.href=%s</script></head><body>%s</body></html>`,
 		jsonEncode(deepLink), authSuccessPage(ghUser.Login))
@@ -115,6 +114,7 @@ func (h *Handler) GoogleCallbackRedirect(w http.ResponseWriter, r *http.Request)
 // ─── Token Exchange ────────────────────────────────────────────────────────
 
 // GitHubExchange handles POST /api/auth/github/exchange.
+// Also accepts a direct GitHub token instead of a code (for server-side exchange flow).
 func (h *Handler) GitHubExchange(w http.ResponseWriter, r *http.Request) {
 	var req CodeExchangeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -126,12 +126,16 @@ func (h *Handler) GitHubExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Exchange code for access token
-	tok, err := exchangeGitHubCode(req.Code, h.Config)
-	if err != nil {
-		log.Printf("[auth] GitHub exchange failed: %v", err)
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Code exchange failed", "detail": err.Error()})
-		return
+	// Direct token import (gho_xxx or ghp_xxx) — skip exchange, fetch user directly.
+	tok := req.Code
+	if !strings.HasPrefix(tok, "gho_") && !strings.HasPrefix(tok, "ghp_") {
+		var err error
+		tok, err = exchangeGitHubCode(req.Code, h.Config)
+		if err != nil {
+			log.Printf("[auth] GitHub exchange failed: %v", err)
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Code exchange failed", "detail": err.Error()})
+			return
+		}
 	}
 
 	// Fetch GitHub user
