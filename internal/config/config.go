@@ -9,7 +9,7 @@ import (
 // Config holds all server configuration loaded from environment variables.
 type Config struct {
 	Port             int
-	DatabasePath     string
+	DatabaseURL      string
 	DeepLinkScheme   string
 	UpstreamAPI      string
 	GitHubClientID   string
@@ -22,7 +22,7 @@ type Config struct {
 func Load() Config {
 	return Config{
 		Port:           envInt("PORT", 3000),
-		DatabasePath:   envStr("DATABASE_PATH", "/app/data/synape.db"),
+		DatabaseURL:    envStr("DATABASE_URL", "postgres://synape:synape@localhost:5432/synape?sslmode=disable"),
 		DeepLinkScheme: envStr("DEEP_LINK_SCHEME", "Synape"),
 		UpstreamAPI:    envStr("UPSTREAM_API", ""),
 		GitHubClientID: envStr("GITHUB_CLIENT_ID", ""),

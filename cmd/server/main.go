@@ -45,12 +45,12 @@ func main() {
 	cfg := config.Load()
 
 	// ─── Database ───────────────────────────────────────────────────────
-	store, err := db.New(cfg.DatabasePath)
+	store, err := db.New(cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
 	defer store.DB.Close()
-	log.Printf("Database: %s", cfg.DatabasePath)
+	log.Printf("Database: %s", cfg.DatabaseURL)
 
 	// ─── Handlers ───────────────────────────────────────────────────────
 	authH := auth.NewHandler(store, cfg)

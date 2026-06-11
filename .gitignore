@@ -29,8 +29,6 @@ vendor/
 .DS_Store
 Thumbs.db
 
-# SQLite (generated at runtime)
-*.db
-*.db-wal
-*.db-shm
+# Database
 /data/
+*.db

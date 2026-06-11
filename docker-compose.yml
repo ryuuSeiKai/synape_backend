@@ -4,11 +4,9 @@ services:
     container_name: synape-server
     ports:
       - "3000:3000"
-    volumes:
-      - synape-data:/app/data
     environment:
       - PORT=3000
-      - DATABASE_PATH=/app/data/synape.db
+      - DATABASE_URL=postgres://synape:synape@synape-db:5432/synape?sslmode=disable
       # OAuth — set your actual secrets here or in a .env file
       - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-Ov23liXcWby6XVM80TfG}
       - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
@@ -18,7 +16,29 @@ services:
       - DEEP_LINK_SCHEME=${DEEP_LINK_SCHEME:-Synape}
       # Optional — API upstream for non-auth routes
       - UPSTREAM_API=${UPSTREAM_API:-}
+    depends_on:
+      synape-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  synape-db:
+    image: postgres:16-alpine
+    container_name: synape-db
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=synape
+      - POSTGRES_PASSWORD=synape
+      - POSTGRES_DB=synape
+    volumes:
+      - synape-pgdata:/var/lib/postgresql/data
+      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synape"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
 volumes:
-  synape-data:
+  synape-pgdata:

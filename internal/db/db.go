@@ -1,34 +1,29 @@
-// Package db provides SQLite-backed storage for users, providers, and sync blobs.
+// Package db provides PostgreSQL-backed storage for users, providers, and sync blobs.
 package db
 
 import (
 	"database/sql"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/lib/pq"
 )
 
-// Store wraps a SQLite database connection.
+// Store wraps a PostgreSQL database connection.
 type Store struct {
 	DB *sql.DB
 }
 
-// New opens (or creates) the SQLite database at path and runs migrations.
-func New(dbPath string) (*Store, error) {
-	dir := filepath.Dir(dbPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("create db directory: %w", err)
-	}
-
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)")
+// New opens a PostgreSQL database and runs migrations.
+func New(databaseURL string) (*Store, error) {
+	db, err := sql.Open("postgres", databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 
-	db.SetMaxOpenConns(1) // SQLite doesn't support concurrent writes
+	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
 
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("ping database: %w", err)
@@ -46,33 +41,33 @@ func (s *Store) migrate() error {
 	migrations := []string{
 		`CREATE TABLE IF NOT EXISTS users (
 			id TEXT PRIMARY KEY,
-			user_id INTEGER NOT NULL UNIQUE,
+			user_id BIGINT NOT NULL UNIQUE,
 			email TEXT NOT NULL DEFAULT '',
 			display_name TEXT NOT NULL DEFAULT '',
 			first_name TEXT NOT NULL DEFAULT '',
 			last_name TEXT NOT NULL DEFAULT '',
 			avatar_url TEXT NOT NULL DEFAULT '',
 			slug TEXT NOT NULL DEFAULT '',
-			created_at TEXT NOT NULL,
-			updated_at TEXT NOT NULL
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
 		`CREATE TABLE IF NOT EXISTS providers (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			user_id TEXT NOT NULL REFERENCES users(id),
+			id SERIAL PRIMARY KEY,
+			user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 			provider TEXT NOT NULL,
 			provider_user_id TEXT NOT NULL,
 			provider_login TEXT NOT NULL DEFAULT '',
 			email TEXT NOT NULL DEFAULT '',
-			linked_at TEXT NOT NULL,
-			last_seen_at TEXT NOT NULL,
+			linked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			UNIQUE(user_id, provider)
 		)`,
 		`CREATE TABLE IF NOT EXISTS sync_blobs (
 			kind TEXT PRIMARY KEY,
 			content_hash TEXT NOT NULL,
 			payload TEXT NOT NULL,
-			created_at TEXT NOT NULL DEFAULT (datetime('now')),
-			updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
 	}
 
@@ -91,7 +86,7 @@ func (s *Store) GetUserByDocID(docID string) (*User, error) {
 	u := &User{}
 	err := s.DB.QueryRow(
 		`SELECT id, user_id, email, display_name, first_name, last_name, avatar_url, slug, created_at, updated_at
-		 FROM users WHERE id = ?`, docID,
+		 FROM users WHERE id = $1`, docID,
 	).Scan(&u.ID, &u.UserID, &u.Email, &u.DisplayName, &u.FirstName, &u.LastName, &u.AvatarURL, &u.Slug, &u.CreatedAt, &u.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -100,11 +95,10 @@ func (s *Store) GetUserByDocID(docID string) (*User, error) {
 }
 
 // GetUserByProviderUserID returns a user by provider + provider_user_id.
-// Used when re-authenticating with a known provider identity.
 func (s *Store) GetUserByProviderUserID(provider, providerUserID string) (*User, error) {
 	var docID string
 	err := s.DB.QueryRow(
-		`SELECT user_id FROM providers WHERE provider = ? AND provider_user_id = ?`,
+		`SELECT user_id FROM providers WHERE provider = $1 AND provider_user_id = $2`,
 		provider, providerUserID,
 	).Scan(&docID)
 	if err == sql.ErrNoRows {
@@ -126,15 +120,15 @@ func (s *Store) UpsertUser(u *User) error {
 
 	_, err := s.DB.Exec(
 		`INSERT INTO users (id, user_id, email, display_name, first_name, last_name, avatar_url, slug, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		 ON CONFLICT(id) DO UPDATE SET
-			email=excluded.email,
-			display_name=excluded.display_name,
-			first_name=excluded.first_name,
-			last_name=excluded.last_name,
-			avatar_url=excluded.avatar_url,
-			slug=excluded.slug,
-			updated_at=excluded.updated_at`,
+			email=EXCLUDED.email,
+			display_name=EXCLUDED.display_name,
+			first_name=EXCLUDED.first_name,
+			last_name=EXCLUDED.last_name,
+			avatar_url=EXCLUDED.avatar_url,
+			slug=EXCLUDED.slug,
+			updated_at=EXCLUDED.updated_at`,
 		u.ID, u.UserID, u.Email, u.DisplayName, u.FirstName, u.LastName, u.AvatarURL, u.Slug, u.CreatedAt, u.UpdatedAt,
 	)
 	return err
@@ -144,18 +138,15 @@ func (s *Store) UpsertUser(u *User) error {
 func (s *Store) UpdateUserProfile(docID string, displayName, firstName, lastName *string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	_, err := s.DB.Exec(
-		`UPDATE users SET display_name=?, first_name=?, last_name=?, updated_at=? WHERE id=?`,
+		`UPDATE users SET display_name=$1, first_name=$2, last_name=$3, updated_at=$4 WHERE id=$5`,
 		coalesce(displayName, ""), coalesce(firstName, ""), coalesce(lastName, ""), now, docID,
 	)
 	return err
 }
 
-// DeleteUser removes a user and their providers.
+// DeleteUser removes a user and their providers (providers cascade via FK).
 func (s *Store) DeleteUser(docID string) error {
-	if _, err := s.DB.Exec(`DELETE FROM providers WHERE user_id = ?`, docID); err != nil {
-		return err
-	}
-	_, err := s.DB.Exec(`DELETE FROM users WHERE id = ?`, docID)
+	_, err := s.DB.Exec(`DELETE FROM users WHERE id = $1`, docID)
 	return err
 }
 
@@ -165,7 +156,7 @@ func (s *Store) DeleteUser(docID string) error {
 func (s *Store) GetProviders(userDocID string) ([]Provider, error) {
 	rows, err := s.DB.Query(
 		`SELECT provider, provider_user_id, provider_login, email, linked_at, last_seen_at
-		 FROM providers WHERE user_id = ?`, userDocID,
+		 FROM providers WHERE user_id = $1`, userDocID,
 	)
 	if err != nil {
 		return nil, err
@@ -193,12 +184,12 @@ func (s *Store) UpsertProvider(p *Provider) error {
 
 	_, err := s.DB.Exec(
 		`INSERT INTO providers (user_id, provider, provider_user_id, provider_login, email, linked_at, last_seen_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
 		 ON CONFLICT(user_id, provider) DO UPDATE SET
-			provider_user_id=excluded.provider_user_id,
-			provider_login=excluded.provider_login,
-			email=excluded.email,
-			last_seen_at=excluded.last_seen_at`,
+			provider_user_id=EXCLUDED.provider_user_id,
+			provider_login=EXCLUDED.provider_login,
+			email=EXCLUDED.email,
+			last_seen_at=EXCLUDED.last_seen_at`,
 		p.UserID, p.Provider, p.ProviderUserID, p.ProviderLogin, p.Email, p.LinkedAt, p.LastSeenAt,
 	)
 	return err
@@ -206,7 +197,7 @@ func (s *Store) UpsertProvider(p *Provider) error {
 
 // DeleteProvider removes a provider link.
 func (s *Store) DeleteProvider(userDocID, provider string) error {
-	_, err := s.DB.Exec(`DELETE FROM providers WHERE user_id = ? AND provider = ?`, userDocID, provider)
+	_, err := s.DB.Exec(`DELETE FROM providers WHERE user_id = $1 AND provider = $2`, userDocID, provider)
 	return err
 }
 
@@ -235,7 +226,7 @@ func (s *Store) GetSyncBlobs() ([]SyncBlob, error) {
 func (s *Store) GetSyncBlob(kind string) (*SyncBlob, error) {
 	b := &SyncBlob{}
 	err := s.DB.QueryRow(
-		`SELECT kind, content_hash, payload, created_at, updated_at FROM sync_blobs WHERE kind = ?`, kind,
+		`SELECT kind, content_hash, payload, created_at, updated_at FROM sync_blobs WHERE kind = $1`, kind,
 	).Scan(&b.Kind, &b.ContentHash, &b.Payload, &b.CreatedAt, &b.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -248,12 +239,12 @@ func (s *Store) UpsertSyncBlob(kind, contentHash, payload string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	_, err := s.DB.Exec(
 		`INSERT INTO sync_blobs (kind, content_hash, payload, created_at, updated_at)
-		 VALUES (?, ?, ?, datetime('now'), ?)
+		 VALUES ($1, $2, $3, NOW(), $4)
 		 ON CONFLICT(kind) DO UPDATE SET
-			content_hash=excluded.content_hash,
-			payload=excluded.payload,
-			updated_at=?`,
-		kind, contentHash, payload, now, now,
+			content_hash=EXCLUDED.content_hash,
+			payload=EXCLUDED.payload,
+			updated_at=$4`,
+		kind, contentHash, payload, now,
 	)
 	return err
 }
