@@ -1,23 +1,11 @@
 services:
-  caddy:
-    image: caddy:2
-    container_name: caddy
-    ports:
-      - "3443:3443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-    depends_on:
-      - synape-server
-    restart: unless-stopped
-
   synape-server:
     build: .
     container_name: synape-server
     ports:
-      - "3001:3001"
+      - "3000:3000"
     environment:
-      - PORT=3001
+      - PORT=3000
       - DATABASE_URL=postgres://synape:synape@synape-db:5432/synape?sslmode=disable
       - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-Ov23liXcWby6XVM80TfG}
       - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
@@ -50,4 +38,3 @@ services:
 
 volumes:
   synape-pgdata:
-  caddy-data:
