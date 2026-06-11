@@ -77,6 +77,10 @@ func main() {
 	r.Get("/auth/callback", authH.CallbackRedirect)
 	r.Get("/auth/google-callback.html", authH.GoogleCallbackRedirect)
 
+	// Ticket polling routes (no deep-link needed)
+	r.Post("/api/auth/ticket", authH.CreateTicket)
+	r.Get("/api/auth/ticket/{id}", authH.PollTicket)
+
 	// Auth API routes
 	r.Post("/api/auth/github/exchange", authH.GitHubExchange)
 	r.Post("/api/auth/google/exchange", authH.GoogleExchange)

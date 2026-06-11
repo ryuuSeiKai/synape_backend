@@ -3,6 +3,7 @@ package auth
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -10,11 +11,40 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ryuuvu/synape-server/internal/config"
 	"github.com/ryuuvu/synape-server/internal/db"
 )
+
+// Ticket holds the result of an OAuth flow, keyed by a state UUID.
+type Ticket struct {
+	Status    string    // "pending" or "ready"
+	Token     *string   `json:"token,omitempty"`
+	UserID    int64     `json:"userId,omitempty"`
+	Providers []db.Provider `json:"providers,omitempty"`
+	CreatedAt time.Time
+}
+
+// ticketStore holds pending OAuth tickets in memory.
+var ticketStore sync.Map
+
+func init() {
+	// Cleanup old tickets every 5 minutes.
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+			ticketStore.Range(func(key, value interface{}) bool {
+				t := value.(*Ticket)
+				if time.Since(t.CreatedAt) > 10*time.Minute {
+					ticketStore.Delete(key)
+				}
+				return true
+			})
+		}
+	}()
+}
 
 // Handler holds dependencies for auth HTTP handlers.
 type Handler struct {
@@ -25,6 +55,49 @@ type Handler struct {
 // NewHandler creates a new auth Handler.
 func NewHandler(store *db.Store, cfg config.Config) *Handler {
 	return &Handler{Store: store, Config: cfg}
+}
+
+// ─── Ticket endpoints ─────────────────────────────────────────────────────
+
+// CreateTicket handles POST /api/auth/ticket.
+// Creates a pending ticket and returns its ID.
+func (h *Handler) CreateTicket(w http.ResponseWriter, r *http.Request) {
+	id, err := newUUID()
+	if err != nil {
+		log.Printf("[ticket] create uuid failed: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	ticketStore.Store(id, &Ticket{Status: "pending", CreatedAt: time.Now()})
+	writeJSON(w, http.StatusOK, map[string]string{"ticket": id})
+}
+
+// PollTicket handles GET /api/auth/ticket/{id}.
+// Returns the ticket status: pending or ready with auth data.
+func (h *Handler) PollTicket(w http.ResponseWriter, r *http.Request) {
+	id := extractKind(r.URL.Path, "/api/auth/ticket/")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing ticket id"})
+		return
+	}
+	val, ok := ticketStore.Load(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "ticket not found"})
+		return
+	}
+	t := val.(*Ticket)
+	if t.Status == "ready" {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status":    "ready",
+			"token":     t.Token,
+			"userId":    t.UserID,
+			"providers": t.Providers,
+		})
+		// Clean up after read.
+		ticketStore.Delete(id)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "pending"})
 }
 
 // ─── OAuth Callback Redirects ──────────────────────────────────────────────
@@ -89,19 +162,31 @@ func (h *Handler) CallbackRedirect(w http.ResponseWriter, r *http.Request) {
 	_ = h.Store.UpsertProvider(prov)
 
 	log.Printf("[oauth] GitHub auth success: %s", ghUser.Login)
-	// Redirect to deep-link with the actual token so the desktop app can store it.
-	deepLink := fmt.Sprintf("%s://oauth-callback?provider=github&token=%s", h.Config.DeepLinkScheme, urlencode(tok))
-	fallback := authSuccessPage(ghUser.Login)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8">
-<script>
-window.location.href=%s;
-setTimeout(function(){
-  document.getElementById('fallback').style.display='block';
-}, 2000);
-</script></head><body>
-<div id="fallback" style="display:none">%s</div>
-</body></html>`, jsonEncode(deepLink), fallback)
+
+	// Store result in ticket if state parameter was provided (polling flow).
+	state := r.URL.Query().Get("state")
+	if state != "" {
+		providers, _ := h.Store.GetProviders(docID)
+		ticketStore.Store(state, &Ticket{
+			Status:    "ready",
+			Token:     &tok,
+			UserID:    ghUser.ID,
+			Providers: providers,
+			CreatedAt: time.Now(),
+		})
+		log.Printf("[ticket] stored result for ticket %s", state)
+		// Redirect back with a "done" signal. The app polls the ticket endpoint.
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Synape - Signed In</title>
+<style>body{font-family:sans-serif;background:#0d1117;color:#e6edf3;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2.5rem;text-align:center}.check{width:48px;height:48px;border-radius:50%;background:#238636;display:inline-flex;align-items:center;justify-content:center;font-size:24px;color:#fff;margin-bottom:1rem}h2{margin:0}p{color:#8b949e}</style></head>
+<body><div class="card"><div class="check">&#10003;</div>
+<h2>Signed in as ` + htmlEsc(ghUser.Login) + `</h2>
+<p>You can close this window.</p></div></body></html>`)
+		return
+	}
+
+	// No state — fallback: show success page (direct browser flow).
+	writeHTML(w, http.StatusOK, authSuccessPage(ghUser.Login))
 }
 
 // GoogleCallbackRedirect handles GET /auth/google-callback.html.
@@ -969,4 +1054,23 @@ func htmlEsc(s string) string {
 	s = strings.ReplaceAll(s, "\"", "&quot;")
 	s = strings.ReplaceAll(s, "'", "&#39;")
 	return s
+}
+
+// newUUID returns a random hex string for use as a ticket state ID.
+func newUUID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", b), nil
+}
+
+// extractKind extracts a path parameter after a fixed prefix.
+func extractKind(path, prefix string) string {
+	if !strings.HasPrefix(path, prefix) {
+		return ""
+	}
+	kind := strings.TrimPrefix(path, prefix)
+	kind = strings.TrimSuffix(kind, "/")
+	return kind
 }
