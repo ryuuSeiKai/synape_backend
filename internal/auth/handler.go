@@ -140,13 +140,17 @@ func (h *Handler) CallbackRedirect(w http.ResponseWriter, r *http.Request) {
 		createdAt = existing.CreatedAt
 	}
 
+	displayName := ghUser.Name
+	if displayName == "" {
+		displayName = ghUser.Login
+	}
 	user := &db.User{
 		ID: docID, UserID: ghUser.ID, Email: email,
-		DisplayName: ghUser.Login, FirstName: ghUser.Name, AvatarURL: ghUser.AvatarURL,
+		DisplayName: displayName, FirstName: ghUser.Name, AvatarURL: ghUser.AvatarURL,
 		Slug: ghUser.Login, CreatedAt: createdAt,
 	}
 	if user.FirstName == "" {
-		user.FirstName = ghUser.Login
+		user.FirstName = displayName
 	}
 	if err := h.Store.UpsertUser(user); err != nil {
 		log.Printf("[auth] upsert failed: %v", err)
@@ -180,13 +184,13 @@ func (h *Handler) CallbackRedirect(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Synape - Signed In</title>
 <style>body{font-family:sans-serif;background:#0d1117;color:#e6edf3;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2.5rem;text-align:center}.check{width:48px;height:48px;border-radius:50%;background:#238636;display:inline-flex;align-items:center;justify-content:center;font-size:24px;color:#fff;margin-bottom:1rem}h2{margin:0}p{color:#8b949e}</style></head>
 <body><div class="card"><div class="check">&#10003;</div>
-<h2>Signed in as ` + htmlEsc(ghUser.Login) + `</h2>
+<h2>Signed in as ` + htmlEsc(displayName) + `</h2>
 <p>You can close this window.</p></div></body></html>`)
 		return
 	}
 
 	// No state — fallback: show success page (direct browser flow).
-	writeHTML(w, http.StatusOK, authSuccessPage(ghUser.Login))
+	writeHTML(w, http.StatusOK, authSuccessPage(displayName))
 }
 
 // GoogleCallbackRedirect handles GET /auth/google-callback.html.
@@ -256,11 +260,15 @@ func (h *Handler) GitHubExchange(w http.ResponseWriter, r *http.Request) {
 		createdAt = existing.CreatedAt
 	}
 
+	displayName := ghUser.Name
+	if displayName == "" {
+		displayName = ghUser.Login
+	}
 	user := &db.User{
 		ID:          docID,
 		UserID:      ghUser.ID,
 		Email:       email,
-		DisplayName: ghUser.Login,
+		DisplayName: displayName,
 		FirstName:   ghUser.Name,
 		LastName:    "",
 		AvatarURL:   ghUser.AvatarURL,
@@ -268,7 +276,7 @@ func (h *Handler) GitHubExchange(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:   createdAt,
 	}
 	if user.FirstName == "" {
-		user.FirstName = ghUser.Login
+		user.FirstName = displayName
 	}
 
 	if err := h.Store.UpsertUser(user); err != nil {
