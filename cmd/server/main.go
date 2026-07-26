@@ -56,7 +56,7 @@ func main() {
 
 	// ─── Handlers ───────────────────────────────────────────────────────
 	authH := auth.NewHandler(store, cfg)
-	syncH := sync.NewHandler(store)
+	syncH := sync.NewHandler(store, authH)
 	staticH := handler.NewHandler(cfg)
 
 	// ─── Router ────────────────────────────────────────────────────────

@@ -9,17 +9,19 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/ryuuvu/synape-server/internal/auth"
 	"github.com/ryuuvu/synape-server/internal/db"
 )
 
 // Handler holds dependencies for sync HTTP handlers.
 type Handler struct {
 	Store *db.Store
+	Auth  *auth.Handler
 }
 
 // NewHandler creates a new sync Handler.
-func NewHandler(store *db.Store) *Handler {
-	return &Handler{Store: store}
+func NewHandler(store *db.Store, authH *auth.Handler) *Handler {
+	return &Handler{Store: store, Auth: authH}
 }
 
 // SyncStateRow is the API response for a sync state row.
@@ -53,7 +55,21 @@ type SyncPushRequest struct {
 
 // State handles GET /api/sync/state.
 func (h *Handler) State(w http.ResponseWriter, r *http.Request) {
-	blobs, err := h.Store.GetSyncBlobs()
+	token, provider, err := auth.ExtractAuth(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Not authenticated"})
+		return
+	}
+
+	userID, err := h.Auth.ValidateToken(token, provider)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Token expired"})
+		return
+	}
+
+	userDocID := auth.UserDocID(provider, userID)
+
+	blobs, err := h.Store.GetSyncBlobs(userDocID)
 	if err != nil {
 		log.Printf("[sync] state error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
@@ -74,13 +90,27 @@ func (h *Handler) State(w http.ResponseWriter, r *http.Request) {
 
 // Pull handles GET /api/sync/pull/{kind}.
 func (h *Handler) Pull(w http.ResponseWriter, r *http.Request) {
+	token, provider, err := auth.ExtractAuth(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Not authenticated"})
+		return
+	}
+
+	userID, err := h.Auth.ValidateToken(token, provider)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Token expired"})
+		return
+	}
+
+	userDocID := auth.UserDocID(provider, userID)
+
 	kind := extractKind(r.URL.Path, "/api/sync/pull/")
 	if kind == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing kind"})
 		return
 	}
 
-	blob, err := h.Store.GetSyncBlob(kind)
+	blob, err := h.Store.GetSyncBlob(userDocID, kind)
 	if err != nil {
 		log.Printf("[sync] pull error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
@@ -103,6 +133,20 @@ func (h *Handler) Pull(w http.ResponseWriter, r *http.Request) {
 
 // Push handles PUT /api/sync/push/{kind}.
 func (h *Handler) Push(w http.ResponseWriter, r *http.Request) {
+	token, provider, err := auth.ExtractAuth(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Not authenticated"})
+		return
+	}
+
+	userID, err := h.Auth.ValidateToken(token, provider)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Token expired"})
+		return
+	}
+
+	userDocID := auth.UserDocID(provider, userID)
+
 	kind := extractKind(r.URL.Path, "/api/sync/push/")
 	if kind == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing kind"})
@@ -116,30 +160,50 @@ func (h *Handler) Push(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Optimistic concurrency check
-	if req.PrevHash != nil && *req.PrevHash != "*" {
-		existing, err := h.Store.GetSyncBlob(kind)
+	if req.PrevHash != nil {
+		if *req.PrevHash != "*" {
+			existing, err := h.Store.GetSyncBlob(userDocID, kind)
+			if err != nil {
+				log.Printf("[sync] push conflict check error: %v", err)
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+				return
+			}
+			if existing != nil && existing.ContentHash != *req.PrevHash {
+				writeJSON(w, http.StatusPreconditionFailed, map[string]interface{}{
+					"error":              "conflict",
+					"currentHash":        existing.ContentHash,
+					"currentUpdatedAt":   existing.UpdatedAt,
+				})
+				return
+			}
+		}
+	} else {
+		// First push of this kind (server requires row to not exist)
+		existing, err := h.Store.GetSyncBlob(userDocID, kind)
 		if err != nil {
 			log.Printf("[sync] push conflict check error: %v", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 			return
 		}
-		if existing != nil && existing.ContentHash != *req.PrevHash {
+		if existing != nil {
 			writeJSON(w, http.StatusPreconditionFailed, map[string]interface{}{
 				"error":              "conflict",
 				"currentHash":        existing.ContentHash,
 				"currentUpdatedAt":   existing.UpdatedAt,
+				"detail":             "blob already exists but client expected first-time sync",
 			})
 			return
 		}
 	}
 
-	if err := h.Store.UpsertSyncBlob(kind, req.ContentHash, req.Payload); err != nil {
+
+	if err := h.Store.UpsertSyncBlob(userDocID, kind, req.ContentHash, req.Payload); err != nil {
 		log.Printf("[sync] push error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
 
-	blob, _ := h.Store.GetSyncBlob(kind)
+	blob, _ := h.Store.GetSyncBlob(userDocID, kind)
 
 	resp := SyncPushResponse{
 		Kind:        kind,
@@ -154,13 +218,27 @@ func (h *Handler) Push(w http.ResponseWriter, r *http.Request) {
 
 // Wipe handles DELETE /api/sync/wipe.
 func (h *Handler) Wipe(w http.ResponseWriter, r *http.Request) {
+	token, provider, err := auth.ExtractAuth(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Not authenticated"})
+		return
+	}
+
+	userID, err := h.Auth.ValidateToken(token, provider)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Token expired"})
+		return
+	}
+
+	userDocID := auth.UserDocID(provider, userID)
+
 	confirm := r.Header.Get("X-Confirm")
 	if confirm != "yes" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "requires X-Confirm: yes"})
 		return
 	}
 
-	if err := h.Store.WipeSyncBlobs(); err != nil {
+	if err := h.Store.WipeSyncBlobs(userDocID); err != nil {
 		log.Printf("[sync] wipe error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return

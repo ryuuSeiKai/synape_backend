@@ -38,6 +38,19 @@ func New(databaseURL string) (*Store, error) {
 }
 
 func (s *Store) migrate() error {
+	// Drop the legacy sync_blobs table if it exists but lacks user_id
+	var hasUserID bool
+	err := s.DB.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1 
+			FROM information_schema.columns 
+			WHERE table_name='sync_blobs' AND column_name='user_id'
+		)
+	`).Scan(&hasUserID)
+	if err == nil && !hasUserID {
+		_, _ = s.DB.Exec(`DROP TABLE IF EXISTS sync_blobs CASCADE`)
+	}
+
 	migrations := []string{
 		`CREATE TABLE IF NOT EXISTS users (
 			id TEXT PRIMARY KEY,
@@ -63,11 +76,13 @@ func (s *Store) migrate() error {
 			UNIQUE(user_id, provider)
 		)`,
 		`CREATE TABLE IF NOT EXISTS sync_blobs (
-			kind TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			kind TEXT NOT NULL,
 			content_hash TEXT NOT NULL,
 			payload TEXT NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (user_id, kind)
 		)`,
 	}
 
@@ -137,12 +152,33 @@ func (s *Store) UpsertUser(u *User) error {
 // UpdateUserProfile updates display_name, first_name, last_name for a user.
 func (s *Store) UpdateUserProfile(docID string, displayName, firstName, lastName *string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := s.DB.Exec(
-		`UPDATE users SET display_name=$1, first_name=$2, last_name=$3, updated_at=$4 WHERE id=$5`,
-		coalesce(displayName, ""), coalesce(firstName, ""), coalesce(lastName, ""), now, docID,
-	)
+	query := "UPDATE users SET updated_at = $1"
+	args := []interface{}{now}
+	argSeq := 2
+
+	if displayName != nil {
+		query += fmt.Sprintf(", display_name = $%d", argSeq)
+		args = append(args, *displayName)
+		argSeq++
+	}
+	if firstName != nil {
+		query += fmt.Sprintf(", first_name = $%d", argSeq)
+		args = append(args, *firstName)
+		argSeq++
+	}
+	if lastName != nil {
+		query += fmt.Sprintf(", last_name = $%d", argSeq)
+		args = append(args, *lastName)
+		argSeq++
+	}
+
+	query += fmt.Sprintf(" WHERE id = $%d", argSeq)
+	args = append(args, docID)
+
+	_, err := s.DB.Exec(query, args...)
 	return err
 }
+
 
 // DeleteUser removes a user and their providers (providers cascade via FK).
 func (s *Store) DeleteUser(docID string) error {
@@ -203,9 +239,12 @@ func (s *Store) DeleteProvider(userDocID, provider string) error {
 
 // ─── Sync blob operations ─────────────────────────────────────────────────
 
-// GetSyncBlobs returns all sync blobs (state only).
-func (s *Store) GetSyncBlobs() ([]SyncBlob, error) {
-	rows, err := s.DB.Query(`SELECT kind, content_hash, updated_at FROM sync_blobs ORDER BY kind`)
+// GetSyncBlobs returns all sync blobs for a user (state only).
+func (s *Store) GetSyncBlobs(userDocID string) ([]SyncBlob, error) {
+	rows, err := s.DB.Query(
+		`SELECT kind, content_hash, updated_at FROM sync_blobs WHERE user_id = $1 ORDER BY kind`,
+		userDocID,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -222,11 +261,12 @@ func (s *Store) GetSyncBlobs() ([]SyncBlob, error) {
 	return blobs, rows.Err()
 }
 
-// GetSyncBlob returns a single sync blob by kind.
-func (s *Store) GetSyncBlob(kind string) (*SyncBlob, error) {
+// GetSyncBlob returns a single sync blob by user and kind.
+func (s *Store) GetSyncBlob(userDocID, kind string) (*SyncBlob, error) {
 	b := &SyncBlob{}
 	err := s.DB.QueryRow(
-		`SELECT kind, content_hash, payload, created_at, updated_at FROM sync_blobs WHERE kind = $1`, kind,
+		`SELECT kind, content_hash, payload, created_at, updated_at FROM sync_blobs WHERE user_id = $1 AND kind = $2`,
+		userDocID, kind,
 	).Scan(&b.Kind, &b.ContentHash, &b.Payload, &b.CreatedAt, &b.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -234,24 +274,24 @@ func (s *Store) GetSyncBlob(kind string) (*SyncBlob, error) {
 	return b, err
 }
 
-// UpsertSyncBlob inserts or updates a sync blob.
-func (s *Store) UpsertSyncBlob(kind, contentHash, payload string) error {
+// UpsertSyncBlob inserts or updates a sync blob for a user.
+func (s *Store) UpsertSyncBlob(userDocID, kind, contentHash, payload string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	_, err := s.DB.Exec(
-		`INSERT INTO sync_blobs (kind, content_hash, payload, created_at, updated_at)
-		 VALUES ($1, $2, $3, NOW(), $4)
-		 ON CONFLICT(kind) DO UPDATE SET
+		`INSERT INTO sync_blobs (user_id, kind, content_hash, payload, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, NOW(), $5)
+		 ON CONFLICT(user_id, kind) DO UPDATE SET
 			content_hash=EXCLUDED.content_hash,
 			payload=EXCLUDED.payload,
-			updated_at=$4`,
-		kind, contentHash, payload, now,
+			updated_at=$5`,
+		userDocID, kind, contentHash, payload, now,
 	)
 	return err
 }
 
-// WipeSyncBlobs removes all sync blobs.
-func (s *Store) WipeSyncBlobs() error {
-	_, err := s.DB.Exec(`DELETE FROM sync_blobs`)
+// WipeSyncBlobs removes all sync blobs for a user.
+func (s *Store) WipeSyncBlobs(userDocID string) error {
+	_, err := s.DB.Exec(`DELETE FROM sync_blobs WHERE user_id = $1`, userDocID)
 	return err
 }
 

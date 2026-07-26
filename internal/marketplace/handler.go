@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -103,19 +104,33 @@ func HandleSkills(w http.ResponseWriter, r *http.Request) {
 
 // HandleSkill handles GET /api/marketplace/skill?url=...
 func HandleSkill(w http.ResponseWriter, r *http.Request) {
-	url := r.URL.Query().Get("url")
-	if url == "" {
+	urlStr := r.URL.Query().Get("url")
+	if urlStr == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing url"})
 		return
 	}
 
-	// Ensure it's an agentpedia URL
-	if !strings.Contains(url, "agentpedia.codes/agent-skills/") {
+	u, err := url.Parse(urlStr)
+	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid url"})
 		return
 	}
 
-	content, err := fetchSkillContent(url)
+	// Ensure it's exactly an agentpedia URL to prevent SSRF
+	if u.Scheme != "https" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid url scheme (must be https)"})
+		return
+	}
+	if u.Host != "agentpedia.codes" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid url host"})
+		return
+	}
+	if !strings.HasPrefix(u.Path, "/agent-skills/") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid url path"})
+		return
+	}
+
+	content, err := fetchSkillContent(urlStr)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -125,14 +140,34 @@ func HandleSkill(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(content))
 }
 
+var skillHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if req.URL.Scheme != "https" {
+			return fmt.Errorf("redirect scheme must be https")
+		}
+		if req.URL.Host != "agentpedia.codes" {
+			return fmt.Errorf("redirect host must be agentpedia.codes")
+		}
+		if !strings.HasPrefix(req.URL.Path, "/agent-skills/") {
+			return fmt.Errorf("redirect path must start with /agent-skills/")
+		}
+		if len(via) >= 3 {
+			return fmt.Errorf("too many redirects")
+		}
+		return nil
+	},
+}
+
 func fetchAndParseSitemap() (SkillsResponse, error) {
-	resp, err := http.Get("https://agentpedia.codes/agent-skills/sitemap.xml")
+	resp, err := skillHTTPClient.Get("https://agentpedia.codes/agent-skills/sitemap.xml")
 	if err != nil {
 		return SkillsResponse{}, fmt.Errorf("fetch sitemap: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// Limit sitemap to 10 MB to prevent DoS/memory exhaustion
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
 	if err != nil {
 		return SkillsResponse{}, fmt.Errorf("read sitemap: %w", err)
 	}
@@ -177,13 +212,14 @@ func fetchAndParseSitemap() (SkillsResponse, error) {
 }
 
 func fetchSkillContent(url string) (string, error) {
-	resp, err := http.Get(url)
+	resp, err := skillHTTPClient.Get(url)
 	if err != nil {
 		return "", fmt.Errorf("fetch skill page: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// Limit skill content to 2 MB to prevent DoS/memory exhaustion
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
 	if err != nil {
 		return "", fmt.Errorf("read skill page: %w", err)
 	}

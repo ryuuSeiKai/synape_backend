@@ -134,6 +134,8 @@ type googleTokenResponse struct {
 
 // googleClaims represents the standard claims in a Google id_token JWT.
 type googleClaims struct {
+	Iss        string `json:"iss"`
+	Aud        string `json:"aud"`
 	Sub        string `json:"sub"`
 	Email      string `json:"email"`
 	Name       string `json:"name"`

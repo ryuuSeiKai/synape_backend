@@ -2,13 +2,16 @@
 package auth
 
 import (
+	"crypto"
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/big"
 	"net/http"
 	"strings"
 	"sync"
@@ -132,9 +135,24 @@ func (h *Handler) CallbackRedirect(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	docID := fmt.Sprintf("gh:%d", ghUser.ID)
+	providerUserID := fmt.Sprintf("%d", ghUser.ID)
+	docID := fmt.Sprintf("gh:%s", providerUserID)
+	existing, err := h.Store.GetUserByProviderUserID("github", providerUserID)
+	if err != nil {
+		log.Printf("[auth] GitHub callback lookup failed: %v", err)
+	}
+	if existing == nil {
+		existing, _ = h.Store.GetUserByDocID(docID)
+	} else {
+		docID = existing.ID
+	}
+
+	userID := ghUser.ID
+	if existing != nil {
+		userID = existing.UserID
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339)
-	existing, _ := h.Store.GetUserByDocID(docID)
 	createdAt := now
 	if existing != nil {
 		createdAt = existing.CreatedAt
@@ -145,7 +163,7 @@ func (h *Handler) CallbackRedirect(w http.ResponseWriter, r *http.Request) {
 		displayName = ghUser.Login
 	}
 	user := &db.User{
-		ID: docID, UserID: ghUser.ID, Email: email,
+		ID: docID, UserID: userID, Email: email,
 		DisplayName: displayName, FirstName: ghUser.Name, AvatarURL: ghUser.AvatarURL,
 		Slug: ghUser.Login, CreatedAt: createdAt,
 	}
@@ -160,7 +178,7 @@ func (h *Handler) CallbackRedirect(w http.ResponseWriter, r *http.Request) {
 
 	prov := &db.Provider{
 		UserID: docID, Provider: "github",
-		ProviderUserID: fmt.Sprintf("%d", ghUser.ID),
+		ProviderUserID: providerUserID,
 		ProviderLogin: ghUser.Login, Email: email, LinkedAt: createdAt,
 	}
 	_ = h.Store.UpsertProvider(prov)
@@ -170,15 +188,27 @@ func (h *Handler) CallbackRedirect(w http.ResponseWriter, r *http.Request) {
 	// Store result in ticket if state parameter was provided (polling flow).
 	state := r.URL.Query().Get("state")
 	if state != "" {
-		providers, _ := h.Store.GetProviders(docID)
-		ticketStore.Store(state, &Ticket{
-			Status:    "ready",
-			Token:     &tok,
-			UserID:    ghUser.ID,
-			Providers: providers,
-			CreatedAt: time.Now(),
-		})
-		log.Printf("[ticket] stored result for ticket %s", state)
+		if val, ok := ticketStore.Load(state); ok {
+			if t, ok := val.(*Ticket); ok && t.Status == "pending" {
+				providers, _ := h.Store.GetProviders(docID)
+				ticketStore.Store(state, &Ticket{
+					Status:    "ready",
+					Token:     &tok,
+					UserID:    userID,
+					Providers: providers,
+					CreatedAt: time.Now(),
+				})
+				log.Printf("[ticket] stored result for ticket %s", state)
+			} else {
+				log.Printf("[auth] state exists but status is not pending: %s", state)
+				writeHTML(w, http.StatusBadRequest, authErrorPage("Invalid or expired login state"))
+				return
+			}
+		} else {
+			log.Printf("[auth] unauthorized callback with unknown state: %s", state)
+			writeHTML(w, http.StatusBadRequest, authErrorPage("Invalid or expired login state"))
+			return
+		}
 		// Redirect back with a "done" signal. The app polls the ticket endpoint.
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Synape - Signed In</title>
@@ -348,8 +378,8 @@ func (h *Handler) GoogleExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Decode id_token JWT (no signature verification — just extract claims)
-	claims, err := decodeGoogleIDToken(tok.IDToken)
+	// Decode and verify id_token JWT
+	claims, err := decodeGoogleIDToken(tok.IDToken, h.Config.GoogleClientID)
 	if err != nil {
 		log.Printf("[auth] Google id_token decode failed: %v", err)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Google id_token decode failed"})
@@ -452,20 +482,20 @@ func (h *Handler) GoogleRefresh(w http.ResponseWriter, r *http.Request) {
 
 // Me handles GET /api/auth/me — returns user info + entitlements.
 func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
-	token, provider, err := extractAuth(r)
+	token, provider, err := ExtractAuth(r)
 	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Not authenticated"})
 		return
 	}
 
-	userID, err := validateToken(token, provider)
+	userID, err := h.ValidateToken(token, provider)
 	if err != nil {
 		log.Printf("[auth] token validation failed: %v", err)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Token expired"})
 		return
 	}
 
-	docID := fmt.Sprintf("%s:%s", provider, userID)
+	docID := UserDocID(provider, userID)
 	user, err := h.Store.GetUserByDocID(docID)
 	if err != nil {
 		log.Printf("[auth] user lookup failed: %v", err)
@@ -494,19 +524,19 @@ func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 
 // UpdateProfile handles PATCH /api/auth/me.
 func (h *Handler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
-	token, provider, err := extractAuth(r)
+	token, provider, err := ExtractAuth(r)
 	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Not authenticated"})
 		return
 	}
 
-	userID, err := validateToken(token, provider)
+	userID, err := h.ValidateToken(token, provider)
 	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Token expired"})
 		return
 	}
 
-	docID := fmt.Sprintf("%s:%s", provider, userID)
+	docID := UserDocID(provider, userID)
 
 	var req ProfileUpdateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -541,20 +571,20 @@ func (h *Handler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 
 // DeleteAccount handles DELETE /api/auth/me.
 func (h *Handler) DeleteAccount(w http.ResponseWriter, r *http.Request) {
-	token, provider, err := extractAuth(r)
+	token, provider, err := ExtractAuth(r)
 	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Not authenticated"})
 		return
 	}
 
-	userID, err := validateToken(token, provider)
+	userID, err := h.ValidateToken(token, provider)
 	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Token expired"})
 		return
 	}
 
 	confirmSlug := r.Header.Get("X-Confirm")
-	docID := fmt.Sprintf("%s:%s", provider, userID)
+	docID := UserDocID(provider, userID)
 
 	user, err := h.Store.GetUserByDocID(docID)
 	if err != nil || user == nil {
@@ -580,19 +610,19 @@ func (h *Handler) DeleteAccount(w http.ResponseWriter, r *http.Request) {
 
 // Link handles POST /api/auth/link — links another provider to existing account.
 func (h *Handler) Link(w http.ResponseWriter, r *http.Request) {
-	token, activeProvider, err := extractAuth(r)
+	token, activeProvider, err := ExtractAuth(r)
 	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Not authenticated"})
 		return
 	}
 
-	userID, err := validateToken(token, activeProvider)
+	userID, err := h.ValidateToken(token, activeProvider)
 	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Token expired"})
 		return
 	}
 
-	docID := fmt.Sprintf("%s:%s", activeProvider, userID)
+	docID := UserDocID(activeProvider, userID)
 
 	var req LinkRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -644,7 +674,7 @@ func (h *Handler) Link(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Google exchange failed"})
 			return
 		}
-		claims, err := decodeGoogleIDToken(tok.IDToken)
+		claims, err := decodeGoogleIDToken(tok.IDToken, h.Config.GoogleClientID)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Google id_token decode failed"})
 			return
@@ -689,19 +719,19 @@ func (h *Handler) Link(w http.ResponseWriter, r *http.Request) {
 
 // Unlink handles POST /api/auth/unlink.
 func (h *Handler) Unlink(w http.ResponseWriter, r *http.Request) {
-	token, provider, err := extractAuth(r)
+	token, provider, err := ExtractAuth(r)
 	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Not authenticated"})
 		return
 	}
 
-	userID, err := validateToken(token, provider)
+	userID, err := h.ValidateToken(token, provider)
 	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Token expired"})
 		return
 	}
 
-	docID := fmt.Sprintf("%s:%s", provider, userID)
+	docID := UserDocID(provider, userID)
 
 	var req UnlinkRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -734,12 +764,16 @@ func (h *Handler) Unlink(w http.ResponseWriter, r *http.Request) {
 // ─── OAuth HTTP helpers ────────────────────────────────────────────────────
 
 func exchangeGitHubCode(code string, cfg config.Config) (string, error) {
-	body := fmt.Sprintf(
-		`{"client_id":"%s","client_secret":"%s","code":"%s"}`,
-		cfg.GitHubClientID, cfg.GitHubSecret, code,
-	)
+	reqBody, err := json.Marshal(map[string]string{
+		"client_id":     cfg.GitHubClientID,
+		"client_secret": cfg.GitHubSecret,
+		"code":          code,
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshal request body: %w", err)
+	}
 	req, err := http.NewRequest("POST", "https://github.com/login/oauth/access_token",
-		strings.NewReader(body))
+		strings.NewReader(string(reqBody)))
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
 	}
@@ -858,16 +892,148 @@ func refreshGoogleToken(refreshToken string, cfg config.Config) (*googleTokenRes
 	return &tok, nil
 }
 
-func decodeGoogleIDToken(idToken string) (*googleClaims, error) {
+// JWK Key structures
+type jwkKey struct {
+	Kty string `json:"kty"`
+	Alg string `json:"alg"`
+	Use string `json:"use"`
+	Kid string `json:"kid"`
+	N   string `json:"n"`
+	E   string `json:"e"`
+}
+
+type jwkKeys struct {
+	Keys []jwkKey `json:"keys"`
+}
+
+var (
+	googleKeys       *jwkKeys
+	googleKeysMu     sync.RWMutex
+	googleKeysExpiry time.Time
+)
+
+func fetchGoogleKeys() (*jwkKeys, error) {
+	googleKeysMu.RLock()
+	if googleKeys != nil && time.Now().Before(googleKeysExpiry) {
+		defer googleKeysMu.RUnlock()
+		return googleKeys, nil
+	}
+	googleKeysMu.RUnlock()
+
+	googleKeysMu.Lock()
+	defer googleKeysMu.Unlock()
+
+	// Double check
+	if googleKeys != nil && time.Now().Before(googleKeysExpiry) {
+		return googleKeys, nil
+	}
+
+	resp, err := http.Get("https://www.googleapis.com/oauth2/v3/certs")
+	if err != nil {
+		if googleKeys != nil {
+			return googleKeys, nil // Use stale keys on network error
+		}
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var keys jwkKeys
+	if err := json.NewDecoder(resp.Body).Decode(&keys); err != nil {
+		return nil, err
+	}
+
+	googleKeys = &keys
+	googleKeysExpiry = time.Now().Add(1 * time.Hour)
+	return googleKeys, nil
+}
+
+type jwtHeader struct {
+	Kid string `json:"kid"`
+	Alg string `json:"alg"`
+}
+
+func getJWTKid(idToken string) (string, error) {
+	parts := strings.Split(idToken, ".")
+	if len(parts) != 3 {
+		return "", fmt.Errorf("invalid JWT")
+	}
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return "", err
+	}
+	var header jwtHeader
+	if err := json.Unmarshal(headerBytes, &header); err != nil {
+		return "", err
+	}
+	return header.Kid, nil
+}
+
+func decodeGoogleIDToken(idToken string, googleClientID string) (*googleClaims, error) {
 	parts := strings.Split(idToken, ".")
 	if len(parts) != 3 {
 		return nil, fmt.Errorf("invalid JWT: expected 3 parts, got %d", len(parts))
 	}
 
-	// Decode payload (part 2)
+	// 1. Decode header to get kid
+	kid, err := getJWTKid(idToken)
+	if err != nil {
+		return nil, fmt.Errorf("get kid: %w", err)
+	}
+
+	// 2. Fetch Google JWKS
+	keys, err := fetchGoogleKeys()
+	if err != nil {
+		return nil, fmt.Errorf("fetch google keys: %w", err)
+	}
+
+	// 3. Find matching key
+	var targetKey *jwkKey
+	for _, key := range keys.Keys {
+		if key.Kid == kid {
+			targetKey = &key
+			break
+		}
+	}
+	if targetKey == nil {
+		return nil, fmt.Errorf("key with kid %s not found", kid)
+	}
+
+	// 4. Decode JWK public key parameters
+	nBytes, err := base64.RawURLEncoding.DecodeString(targetKey.N)
+	if err != nil {
+		return nil, fmt.Errorf("decode modulus: %w", err)
+	}
+	eBytes, err := base64.RawURLEncoding.DecodeString(targetKey.E)
+	if err != nil {
+		return nil, fmt.Errorf("decode exponent: %w", err)
+	}
+	var eVal int
+	for _, b := range eBytes {
+		eVal = (eVal << 8) | int(b)
+	}
+	pubKey := &rsa.PublicKey{
+		N: new(big.Int).SetBytes(nBytes),
+		E: eVal,
+	}
+
+	// 5. Verify signature
+	signedData := parts[0] + "." + parts[1]
+	signatureBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		// Try with padding if decode fails
+		signatureBytes, err = base64.URLEncoding.DecodeString(parts[2])
+		if err != nil {
+			return nil, fmt.Errorf("decode signature: %w", err)
+		}
+	}
+	hashed := sha256.Sum256([]byte(signedData))
+	if err := rsa.VerifyPKCS1v15(pubKey, crypto.SHA256, hashed[:], signatureBytes); err != nil {
+		return nil, fmt.Errorf("signature verification failed: %w", err)
+	}
+
+	// 6. Decode payload (claims)
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		// Try with padding
 		payload, err = base64.URLEncoding.DecodeString(parts[1])
 		if err != nil {
 			return nil, fmt.Errorf("decode payload: %w", err)
@@ -879,9 +1045,15 @@ func decodeGoogleIDToken(idToken string) (*googleClaims, error) {
 		return nil, fmt.Errorf("unmarshal claims: %w", err)
 	}
 
-	// Verify not expired
+	// 7. Verify claims
 	if claims.Exp > 0 && time.Now().Unix() > claims.Exp {
 		return nil, fmt.Errorf("token expired")
+	}
+	if claims.Iss != "https://accounts.google.com" && claims.Iss != "accounts.google.com" {
+		return nil, fmt.Errorf("invalid issuer: %s", claims.Iss)
+	}
+	if googleClientID != "" && claims.Aud != googleClientID {
+		return nil, fmt.Errorf("invalid audience: %s (expected %s)", claims.Aud, googleClientID)
 	}
 
 	return &claims, nil
@@ -889,13 +1061,13 @@ func decodeGoogleIDToken(idToken string) (*googleClaims, error) {
 
 // ─── Token validation ──────────────────────────────────────────────────────
 
-// validateToken returns the provider's user ID string (e.g. GitHub user ID as string, Google sub).
-func validateToken(token string, provider string) (string, error) {
+// ValidateToken returns the provider's user ID string (e.g. GitHub user ID as string, Google sub).
+func (h *Handler) ValidateToken(token string, provider string) (string, error) {
 	switch provider {
 	case "github":
 		return validateGitHubToken(token)
 	case "google":
-		return validateGoogleToken(token)
+		return h.validateGoogleToken(token)
 	default:
 		return "", fmt.Errorf("unknown provider: %s", provider)
 	}
@@ -924,22 +1096,31 @@ func validateGitHubToken(token string) (string, error) {
 	return fmt.Sprintf("%d", u.ID), nil
 }
 
-func validateGoogleToken(token string) (string, error) {
-	claims, err := decodeGoogleIDToken(token)
+func (h *Handler) validateGoogleToken(token string) (string, error) {
+	claims, err := decodeGoogleIDToken(token, h.Config.GoogleClientID)
 	if err != nil {
 		return "", err
 	}
 	return claims.Sub, nil
 }
 
+// UserDocID returns the unique user document ID for a given provider and user ID.
+func UserDocID(provider, userID string) string {
+	prefix := provider
+	if provider == "github" {
+		prefix = "gh"
+	}
+	return fmt.Sprintf("%s:%s", prefix, userID)
+}
+
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
-func extractAuth(r *http.Request) (token, provider string, err error) {
-	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, "Bearer ") {
+func ExtractAuth(r *http.Request) (token, provider string, err error) {
+	authHeader := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authHeader, "Bearer ") {
 		return "", "", fmt.Errorf("missing or invalid Authorization header")
 	}
-	token = strings.TrimPrefix(auth, "Bearer ")
+	token = strings.TrimPrefix(authHeader, "Bearer ")
 	provider = r.Header.Get("X-Provider")
 	if provider == "" {
 		provider = "github"
